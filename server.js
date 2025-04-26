@@ -15,8 +15,26 @@ const server = http.createServer(app);
 // WebSocket Server
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-// Twilio Client
-const twilioClient = new twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
+// Initialize Twilio client with proper error handling
+let twilioClient;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+  console.log('Twilio SMS service initialized');
+} else {
+  console.warn('Twilio credentials not found. SMS notifications will be disabled.');
+  // Create mock Twilio client for development
+  twilioClient = {
+    messages: {
+      create: async (message) => {
+        console.log('[Mock SMS] To:', message.to, 'Body:', message.body);
+        return { sid: 'mock_message_sid' };
+      }
+    }
+  };
+}
 
 // Database Configuration
 const dbConfig = {
@@ -36,8 +54,6 @@ async function connectDB() {
   try {
     pool = await sql.connect(dbConfig);
     console.log('Database connected successfully');
-    
-    // Verify tables exist or create them
     await verifyDatabaseSchema();
   } catch (err) {
     console.error('Database connection failed:', err);
@@ -82,6 +98,7 @@ async function verifyDatabaseSchema() {
         BloodGroup NVARCHAR(5) NOT NULL CHECK (BloodGroup IN ('A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-')),
         UnitsAvailable INT NOT NULL DEFAULT 0,
         LastUpdated DATETIME DEFAULT GETDATE(),
+        Hospital VARCHAR(30),
         CONSTRAINT UQ_BloodGroup UNIQUE (BloodGroup)
       )
     `);
@@ -206,30 +223,25 @@ app.post('/api/login', async (req, res) => {
   try {
     const { email, password, role } = req.body;
 
-    // Validation
     if (!email || !password || !role) {
       return res.status(400).json({ error: 'All fields are required' });
     }
 
-    // Find user
     const result = await pool.request()
       .input('email', sql.VarChar, email)
       .query('SELECT * FROM Users WHERE Email = @email');
 
     const user = result.recordset[0];
 
-    // Verify user exists and role matches
     if (!user || user.Role !== role) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Verify password
     const passwordMatch = await bcrypt.compare(password, user.PasswordHash);
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Generate JWT token
     const token = jwt.sign(
       {
         userId: user.UserID,
@@ -243,12 +255,10 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '1h' }
     );
 
-    // Update last login
     await pool.request()
       .input('userId', sql.Int, user.UserID)
       .query('UPDATE Users SET LastLogin = GETDATE() WHERE UserID = @userId');
 
-    // Successful response
     res.json({
       success: true,
       token,
@@ -272,7 +282,6 @@ app.post('/api/register', async (req, res) => {
   try {
     const { name, email, phone, password, bloodGroup, role } = req.body;
 
-    // Validation
     if (!name || !email || !phone || !password || !bloodGroup || !role) {
       return res.status(400).json({ error: 'All fields are required' });
     }
@@ -281,7 +290,6 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    // Check if user exists
     const userExists = await pool.request()
       .input('email', sql.VarChar, email)
       .query('SELECT UserID FROM Users WHERE Email = @email');
@@ -290,11 +298,9 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
-    // Hash password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // Create user
     const result = await pool.request()
       .input('name', sql.VarChar, name)
       .input('email', sql.VarChar, email)
@@ -310,14 +316,12 @@ app.post('/api/register', async (req, res) => {
 
     const newUser = result.recordset[0];
 
-    // If donor, add to Donors table
     if (role === 'donor') {
       await pool.request()
         .input('userId', sql.Int, newUser.UserID)
         .query('INSERT INTO Donors (UserID) VALUES (@userId)');
     }
 
-    // Generate JWT token
     const token = jwt.sign(
       {
         userId: newUser.UserID,
@@ -365,7 +369,6 @@ app.get('/api/dashboard-data', async (req, res) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    // Execute all queries in parallel
     const [totalDonors, pendingRequests, completedDonations, inventoryResult, activeRequests] = await Promise.all([
       pool.request().query(`
         SELECT COUNT(*) AS count 
@@ -388,7 +391,8 @@ app.get('/api/dashboard-data', async (req, res) => {
         SELECT 
           BloodGroup,
           UnitsAvailable,
-          LastUpdated
+          LastUpdated,
+          Hospital
         FROM BloodInventory
       `),
       pool.request().query(`
@@ -413,14 +417,14 @@ app.get('/api/dashboard-data', async (req, res) => {
       `)
     ]);
 
-    // Ensure all blood types are represented in inventory
     const allBloodTypes = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
     const inventory = allBloodTypes.map(bloodType => {
       const existing = inventoryResult.recordset.find(item => item.BloodGroup === bloodType);
       return {
         bloodGroup: bloodType,
         unitsAvailable: existing ? existing.UnitsAvailable : 0,
-        lastUpdated: existing ? existing.LastUpdated : new Date().toISOString()
+        lastUpdated: existing ? existing.LastUpdated : new Date().toISOString(),
+        hospital: existing ? existing.Hospital : ''
       };
     });
 
@@ -442,6 +446,7 @@ app.get('/api/dashboard-data', async (req, res) => {
     });
   }
 });
+
 // Find Donors by Blood Group
 app.post('/api/find-donors-by-group', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -499,7 +504,6 @@ app.post('/api/emergency-request', async (req, res) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    // Get donor details
     const donorResult = await pool.request()
       .input('donorId', sql.Int, donorId)
       .query(`
@@ -514,7 +518,6 @@ app.post('/api/emergency-request', async (req, res) => {
       return res.status(404).json({ error: 'Donor not found' });
     }
 
-    // Create request
     const requestResult = await pool.request()
       .input('patientName', sql.NVarChar, patientName)
       .input('bloodGroup', sql.NVarChar, bloodGroup)
@@ -551,9 +554,8 @@ app.post('/api/emergency-request', async (req, res) => {
 
     const requestId = requestResult.recordset[0].RequestID;
 
-    // Generate OTP for verification
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpiry = new Date(Date.now() + 30 * 60000); // 30 minutes from now
+    const otpExpiry = new Date(Date.now() + 30 * 60000);
 
     await pool.request()
       .input('requestId', sql.Int, requestId)
@@ -565,7 +567,6 @@ app.post('/api/emergency-request', async (req, res) => {
         WHERE RequestID = @requestId
       `);
 
-    // Create notification
     await createNotification(donor.UserID, {
       type: 'emergency',
       title: 'Emergency Blood Request',
@@ -573,7 +574,6 @@ app.post('/api/emergency-request', async (req, res) => {
       requestId: requestId
     });
 
-    // Notify donor via WebSocket if connected
     const ws = connections.get(donor.UserID.toString());
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -588,11 +588,10 @@ app.post('/api/emergency-request', async (req, res) => {
       }));
     }
 
-    // Send SMS via Twilio
     try {
       await twilioClient.messages.create({
         body: `URGENT: Patient ${patientName} needs ${bloodGroup} blood at ${hospitalName}. Please check your BloodCare app for details.`,
-        from: process.env.TWILIO_PHONE,
+        from: process.env.TWILIO_PHONE_NUMBER,
         to: donor.PhoneNumber
       });
     } catch (twilioError) {
@@ -667,7 +666,6 @@ app.post('/api/verify-otp', async (req, res) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    // Check OTP validity
     const result = await pool.request()
       .input('requestId', sql.Int, requestId)
       .query(`
@@ -700,12 +698,10 @@ app.post('/api/verify-otp', async (req, res) => {
       });
     }
 
-    // Update request status to completed
     await pool.request()
       .input('requestId', sql.Int, requestId)
       .query('UPDATE Requests SET Status = \'Completed\' WHERE RequestID = @requestId');
 
-    // Create donation record
     const requestResult = await pool.request()
       .input('requestId', sql.Int, requestId)
       .query(`
@@ -743,7 +739,6 @@ app.post('/api/verify-otp', async (req, res) => {
         )
       `);
 
-    // Update blood inventory
     await pool.request()
       .input('bloodGroup', sql.NVarChar, request.BloodGroup)
       .query(`
@@ -769,7 +764,6 @@ app.post('/api/verify-otp', async (req, res) => {
 });
 
 // Donation History Endpoint
-// Updated Donation History Endpoint
 app.get('/api/donation-history', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ 
@@ -786,7 +780,6 @@ app.get('/api/donation-history', async (req, res) => {
           });
       }
 
-      // Get donor ID
       const donorResult = await pool.request()
           .input('userId', sql.Int, decoded.userId)
           .query('SELECT DonorID FROM Donors WHERE UserID = @userId');
@@ -800,15 +793,14 @@ app.get('/api/donation-history', async (req, res) => {
 
       const donorId = donorResult.recordset[0].DonorID;
 
-      // Get donation history - USING ONLY COLUMNS THAT EXIST IN YOUR DATABASE
       const result = await pool.request()
           .input('donorId', sql.Int, donorId)
           .query(`
               SELECT 
-                  DonationID,
-                  DonationDate,
-                  Status
-                  /* Only include columns that exist in your database */
+                  DonationID as id,
+                  DonationDate as date,
+                  Status,
+                  Location
               FROM Donations
               WHERE DonorID = @donorId
               ORDER BY DonationDate DESC
@@ -816,12 +808,7 @@ app.get('/api/donation-history', async (req, res) => {
 
       res.json({
           success: true,
-          donations: result.recordset.map(donation => ({
-              id: donation.DonationID,
-              date: donation.DonationDate,
-              status: donation.Status || 'Unknown'
-              /* Map only the fields you actually have */
-          }))
+          donations: result.recordset
       });
 
   } catch (error) {
@@ -863,13 +850,7 @@ app.get('/api/notifications', async (req, res) => {
 
       res.json({
           success: true,
-          notifications: result.recordset.map(notification => ({
-              ...notification,
-              Type: notification.Type || 'general',
-              Title: notification.Title || 'Notification',
-              Message: notification.Message || '',
-              timestamp: notification.timestamp || new Date().toISOString()
-          }))
+          notifications: result.recordset
       });
 
   } catch (error) {
@@ -882,6 +863,75 @@ app.get('/api/notifications', async (req, res) => {
   }
 });
 
+// Mark Notification as Read
+app.post('/api/notifications/:id/read', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Authorization token required' });
+
+  const token = authHeader.split(' ')[1];
+  const notificationId = req.params.id;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    await pool.request()
+      .input('notificationId', sql.Int, notificationId)
+      .input('userId', sql.Int, decoded.userId)
+      .query('UPDATE Notifications SET IsRead = 1 WHERE NotificationID = @notificationId AND UserID = @userId');
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error marking notification as read:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to mark notification as read' 
+    });
+  }
+});
+
+// Get Request Details
+app.get('/api/requests/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Authorization token required' });
+
+  const token = authHeader.split(' ')[1];
+  const requestId = req.params.id;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    const result = await pool.request()
+      .input('requestId', sql.Int, requestId)
+      .query(`
+        SELECT 
+          PatientName,
+          BloodGroup,
+          HospitalName,
+          Location,
+          ContactNumber,
+          Status,
+          RequestDate
+        FROM Requests
+        WHERE RequestID = @requestId
+      `);
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ success: false, error: 'Request not found' });
+    }
+
+    res.json({
+      success: true,
+      request: result.recordset[0]
+    });
+  } catch (error) {
+    console.error('Error fetching request:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch request details' 
+    });
+  }
+});
+
 // Helper Functions
 async function handleDonorResponse(requestId, accepted, donor) {
   try {
@@ -891,7 +941,6 @@ async function handleDonorResponse(requestId, accepted, donor) {
       .input('requestId', sql.Int, requestId)
       .query(`UPDATE Requests SET Status = '${status}' WHERE RequestID = @requestId`);
 
-    // Notify admin via WebSocket
     broadcastToAdmins({
       type: 'donor-response',
       requestId,
@@ -899,7 +948,6 @@ async function handleDonorResponse(requestId, accepted, donor) {
       status: accepted ? 'accepted' : 'rejected'
     });
 
-    // If accepted, create donation record
     if (accepted) {
       const requestResult = await pool.request()
         .input('requestId', sql.Int, requestId)
@@ -945,11 +993,23 @@ async function handleDonorResponse(requestId, accepted, donor) {
 
 async function createNotification(userId, notification) {
   try {
+    let formattedMessage = notification.message;
+    if (notification.type === 'emergency' && notification.requestId) {
+      const request = await pool.request()
+        .input('requestId', sql.Int, notification.requestId)
+        .query('SELECT PatientName, BloodGroup, HospitalName FROM Requests WHERE RequestID = @requestId');
+      
+      if (request.recordset.length > 0) {
+        const reqData = request.recordset[0];
+        formattedMessage = `Patient ${reqData.PatientName} needs ${reqData.BloodGroup} blood at ${reqData.HospitalName}`;
+      }
+    }
+
     await pool.request()
       .input('userId', sql.Int, userId)
       .input('type', sql.VarChar, notification.type)
       .input('title', sql.VarChar, notification.title)
-      .input('message', sql.VarChar, notification.message)
+      .input('message', sql.VarChar, formattedMessage)
       .input('requestId', sql.Int, notification.requestId || null)
       .query(`
         INSERT INTO Notifications (UserID, Type, Title, Message, RequestID)
@@ -963,7 +1023,6 @@ async function createNotification(userId, notification) {
 
 function broadcastToAdmins(message) {
   connections.forEach((ws, userId) => {
-    // In a real app, you would check if the user is an admin before sending
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(message));
     }
